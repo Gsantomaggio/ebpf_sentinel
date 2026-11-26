@@ -8,6 +8,7 @@
 //! All question wording is in [`questions`] so it can be audited and edited in one place.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::IsTerminal as _;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
@@ -131,6 +132,55 @@ fn names(ps: &[Protocol]) -> String {
     ps.iter().map(|p| p.id()).collect::<Vec<_>>().join("/")
 }
 
+/// How a connection is shown in the log, so a correct protocol stands out from a wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    /// The protocol is the one expected on the port.
+    Match,
+    /// The port has no expectation, so there is nothing to compare with.
+    Unchecked,
+    /// A different protocol, or none at all, where one was expected.
+    Mismatch,
+    /// Jev was not sure, or more than one protocol matched.
+    Unsure,
+}
+
+pub fn classify(port: u16, identified: &Identified, verdict: &Verdict) -> Status {
+    match verdict {
+        Verdict::Ok if expected_protocols(port).is_some() => Status::Match,
+        Verdict::Ok => Status::Unchecked,
+        Verdict::Suspicious(_) => match identified {
+            Identified::Undecided | Identified::Several(_) => Status::Unsure,
+            _ => Status::Mismatch,
+        },
+    }
+}
+
+/// Printed above every per-connection line so entries are easy to tell apart.
+const ENTRY_SEPARATOR: &str = "────────────────────────────────────────────────";
+
+impl Status {
+    /// Icon and label, wrapped in bold ANSI colour when `color` is set.
+    pub fn badge(self, color: bool) -> String {
+        let (code, text) = match self {
+            Status::Match => ("1;32", "✅ MATCH   "),
+            Status::Unchecked => ("1;34", "ℹ️  UNCHECKED"),
+            Status::Mismatch => ("1;31", "❌ MISMATCH"),
+            Status::Unsure => ("1;33", "⚠️  UNSURE  "),
+        };
+        if color { format!("\x1b[{code}m{text}\x1b[0m") } else { text.to_owned() }
+    }
+}
+
+fn describe(identified: &Identified) -> String {
+    match identified {
+        Identified::One(p, v) => format!("{} (p={v:.2})", p.id()),
+        Identified::Several(ps) => format!("several: {}", names(ps)),
+        Identified::Undecided => "inconclusive".into(),
+        Identified::Unrecognized => "no known protocol".into(),
+    }
+}
+
 /// Every question sent to Jev. Each asks for one judgment about `first_bytes`.
 mod questions {
     use super::*;
@@ -235,6 +285,8 @@ pub struct JevValidator {
     http: reqwest::Client,
     api_key: String,
     model: String,
+    /// ANSI colours in the log line: only on a terminal, and never when `NO_COLOR` is set.
+    color: bool,
 }
 
 impl JevValidator {
@@ -243,7 +295,8 @@ impl JevValidator {
             .timeout(REQUEST_TIMEOUT)
             .build()
             .context("building the HTTP client")?;
-        Ok(Self { http, api_key, model })
+        let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+        Ok(Self { http, api_key, model, color })
     }
 
     /// The exact payload sent for a connection (logged at debug level, never includes the key).
@@ -281,14 +334,19 @@ impl Validator for JevValidator {
         let probs = probabilities(resp)?;
         let identified = identify(&probs);
         let summary: Vec<String> = probs.iter().map(|(p, v)| format!("{}={v:.2}", p.id())).collect();
+        let port = conn.dst.1;
+        let verdict = decide(port, &identified);
+        let status = classify(port, &identified, &verdict);
+        let expected = expected_protocols(port).map_or("any".to_owned(), names);
         log::info!(
-            "jev {} -> {}: {:?} [{}]",
+            "\n\n{ENTRY_SEPARATOR}\n{} {} -> {}: detected {} | port {port} expects {expected} [{}]",
+            status.badge(self.color),
             std::net::SocketAddr::new(conn.src.0, conn.src.1),
             std::net::SocketAddr::new(conn.dst.0, conn.dst.1),
-            identified,
+            describe(&identified),
             summary.join(" ")
         );
-        Ok(decide(conn.dst.1, &identified))
+        Ok(verdict)
     }
 }
 
@@ -360,6 +418,26 @@ mod tests {
         assert_eq!(decide(5672, &both), Verdict::Ok);
         let mixed = Identified::Several(vec![Protocol::Amqp091, Protocol::Mqtt]);
         assert!(matches!(decide(5672, &mixed), Verdict::Suspicious(_)));
+    }
+
+    #[test]
+    fn status_tells_correct_from_wrong() {
+        let ok = |port, id: Identified| classify(port, &id, &decide(port, &id));
+        let mqtt = Identified::One(Protocol::Mqtt, 0.9);
+        assert_eq!(ok(1883, mqtt.clone()), Status::Match);
+        assert_eq!(ok(5672, mqtt.clone()), Status::Mismatch);
+        assert_eq!(ok(9999, mqtt), Status::Unchecked);
+        assert_eq!(ok(5672, Identified::Unrecognized), Status::Mismatch);
+        assert_eq!(ok(5672, Identified::Undecided), Status::Unsure);
+        let mixed = Identified::Several(vec![Protocol::Amqp091, Protocol::Mqtt]);
+        assert_eq!(ok(5672, mixed), Status::Unsure);
+    }
+
+    #[test]
+    fn badge_colors_only_when_asked() {
+        assert!(!Status::Match.badge(false).contains('\x1b'));
+        assert!(Status::Mismatch.badge(true).starts_with("\x1b[1;31m"));
+        assert!(Status::Match.badge(true).starts_with("\x1b[1;32m"));
     }
 
     #[test]

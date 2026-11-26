@@ -1,0 +1,17 @@
+[package]
+name = "ebpf_port_sentinel-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+ebpf_port_sentinel-common = { path = "../ebpf_port_sentinel-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "ebpf_port_sentinel"
+path = "src/main.rs"
