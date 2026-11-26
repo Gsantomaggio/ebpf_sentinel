@@ -1,4 +1,4 @@
-# ebpf_port_sentinel
+# ebpf Port Sentinel
 
 Watches TCP ports (for example the ports of a RabbitMQ broker) and records the **first bytes of
 every new connection**, to see which protocol each client really speaks. Optionally the bytes are
