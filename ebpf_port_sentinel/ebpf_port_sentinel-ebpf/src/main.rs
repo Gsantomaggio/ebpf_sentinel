@@ -70,6 +70,23 @@ fn read_be32(ctx: &XdpContext, offset: usize) -> Result<u32, ()> {
 }
 
 /// The monitor never drops traffic: every error path ends in XDP_PASS.
+///
+/// Every packet that arrives on the interface goes through here, so most of this function is
+/// about *leaving early*: a packet is narrowed down in stages, and only the one that opens a
+/// watched connection reaches the ring buffer.
+///
+///   1. not IPv4/IPv6 (ARP, VLAN-tagged, ...)         -> pass   (other traffic)
+///   2. not TCP (UDP, ICMP, ...), IP fragment         -> pass   (other traffic)
+///   3. TCP, but destination port not in `PORTS`      -> pass   (other TCP traffic)
+///   4. watched port, but FIN/RST                     -> forget the connection, pass
+///   5. watched port, but no payload (SYN, pure ACK)  -> pass   (handshake, not yet "data")
+///   6. watched port, first packet WITH payload       -> **the connection is detected here**:
+///      `SEEN.insert(.., BPF_NOEXIST)` succeeds only once per connection key, so the first
+///      payload packet is reported and every later packet of the same connection is passed.
+///
+/// A connection is therefore "detected" at its first data segment (for AMQP, the protocol header
+/// sent right after the TCP handshake), not at the SYN, because the protocol is only visible in
+/// the payload.
 fn try_sentinel(ctx: &XdpContext) -> Result<u32, ()> {
     let pass = Ok(xdp_action::XDP_PASS);
 
@@ -85,6 +102,7 @@ fn try_sentinel(ctx: &XdpContext) -> Result<u32, ()> {
     let tcp: usize;
     let l4_len: usize;
 
+    // Stages 1-2: separate IP/TCP from every other kind of traffic.
     // Ethernet (no VLAN) -> IPv4 or IPv6 -> TCP only.
     let ethertype = read_be16(ctx, 12)?;
     if ethertype == ETH_P_IP {
@@ -126,6 +144,9 @@ fn try_sentinel(ctx: &XdpContext) -> Result<u32, ()> {
     let th = ptr_at::<[u8; 20]>(ctx, tcp)?;
     let th = unsafe { &*th };
     let dst_port = u16::from_be_bytes([th[2], th[3]]);
+    // Stage 3: the line between "any TCP" and "TCP we care about". Only packets travelling
+    // towards a watched port (client -> server) continue; replies from the server have the
+    // watched port as *source* and stop here, as does all TCP traffic to other ports.
     if unsafe { PORTS.get(&dst_port) }.is_none() {
         return pass;
     }
@@ -133,6 +154,8 @@ fn try_sentinel(ctx: &XdpContext) -> Result<u32, ()> {
     key.src_port = u16::from_be_bytes([th[0], th[1]]);
     key.dst_port = dst_port;
 
+    // Stage 4: the connection is closing; drop its SEEN entry so that a later connection reusing
+    // the same source port is detected again.
     if th[13] & (TCP_FIN | TCP_RST) != 0 {
         let _ = SEEN.remove(&key);
         return pass;
@@ -143,12 +166,16 @@ fn try_sentinel(ctx: &XdpContext) -> Result<u32, ()> {
         return pass;
     }
     let payload_len = l4_len - tcp_hdr_len;
+    // Stage 5: SYN, SYN-ACK and pure ACKs carry no payload, so there is nothing to inspect yet.
     if payload_len == 0 {
         return pass; // handshake / pure ACK
     }
 
-    // Atomically claim this connection; if it already exists we reported it.
-    if SEEN.insert(&key, &1, BPF_NOEXIST as u64).is_err() {
+    // Stage 6: THIS is where a new connection is detected. The packet is on a watched port, is
+    // not a FIN/RST and carries data. Atomically claim the connection key: the insert succeeds
+    // for the first such packet only (BPF_NOEXIST); for every later packet of the same
+    // connection it fails and we return without reporting again.
+    if SEEN.insert(&key, &1, BPF_NOEXIST as u64).is_err() { // <-- stage 6: detection point
         return pass;
     }
 
