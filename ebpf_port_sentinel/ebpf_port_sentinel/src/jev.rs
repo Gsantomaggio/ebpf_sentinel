@@ -172,6 +172,11 @@ impl Status {
     }
 }
 
+/// Wrap `text` in the ANSI colour `code` when `color` is set.
+fn paint(text: &str, code: &str, color: bool) -> String {
+    if color { format!("\x1b[{code}m{text}\x1b[0m") } else { text.to_owned() }
+}
+
 fn describe(identified: &Identified) -> String {
     match identified {
         Identified::One(p, v) => format!("{} (p={v:.2})", p.id()),
@@ -338,12 +343,13 @@ impl Validator for JevValidator {
         let verdict = decide(port, &identified);
         let status = classify(port, &identified, &verdict);
         let expected = expected_protocols(port).map_or("any".to_owned(), names);
+        let expected = paint(&expected, "1;35", self.color);
         log::info!(
             "\n\n{ENTRY_SEPARATOR}\n{} {} -> {}: detected {} | port {port} expects {expected} [{}]",
             status.badge(self.color),
             std::net::SocketAddr::new(conn.src.0, conn.src.1),
             std::net::SocketAddr::new(conn.dst.0, conn.dst.1),
-            describe(&identified),
+            paint(&describe(&identified), "1;36", self.color),
             summary.join(" ")
         );
         Ok(verdict)
