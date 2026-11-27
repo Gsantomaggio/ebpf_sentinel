@@ -73,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
     let mut watched: HashMap<_, u16, u8> =
         HashMap::try_from(ebpf.map_mut("PORTS").context("no PORTS map")?)?;
     for port in &ports {
-        watched.insert(port, 1, 0)?;
+        watched.insert(port, &1, 0)?;
     }
 
     let events = RingBuf::try_from(ebpf.take_map("EVENTS").context("no EVENTS map")?)?;
@@ -83,7 +83,9 @@ async fn main() -> anyhow::Result<()> {
     let program: &mut Xdp = ebpf.program_mut("ebpf_port_sentinel").unwrap().try_into()?;
     program.load()?;
     for name in &iface {
-        program.attach(name, XdpMode::default()).with_context(|| {
+        let cname = std::ffi::CString::new(name.as_str())
+            .with_context(|| format!("invalid interface name {name:?}"))?;
+        program.attach(&cname, XdpMode::default()).with_context(|| {
             format!("failed to attach the XDP program to {name} (try XdpMode::SkbMode)")
         })?;
     }
